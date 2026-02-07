@@ -8,10 +8,13 @@ Author: David P.
 """
 
 import argparse
+import hashlib
 import json
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 import requests
 from lxml import html
@@ -19,6 +22,7 @@ from lxml import html
 re_year = re.compile(r"\b(?:19|20)\d\d\b")
 re_date = re.compile(r"\b(?:19|20)\d\d-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])\b")
 re_id = re.compile(r"/subject/(\d+)/")
+re_difficulty = re.compile(r"difficulty\s*=\s*(\d+)")
 rating_map = {
     "rating1-t": 1,
     "rating2-t": 2,
@@ -41,10 +45,88 @@ session.headers.update(
     }
 )
 
+_pow_lock = threading.Lock()
+
+
+def _solve_pow(cha: str, difficulty: int) -> int:
+    """
+    Python version of Douban's JS PoW:
+    find smallest nonce >= 1 such that
+    sha512(cha + str(nonce)) has a hex digest starting with difficulty zeros.
+    """
+    target = "0" * difficulty
+    cha_bytes = cha.encode("utf-8")
+    nonce = 0
+    while True:
+        nonce += 1
+        digest = hashlib.sha512(cha_bytes + str(nonce).encode("ascii")).hexdigest()
+        if digest.startswith(target):
+            return nonce
+
+
+def _maybe_handle_pow(res: requests.Response, original_url: str) -> requests.Response:
+    """
+    If `res` is the PoW challenge page, solve it and then re-fetch original_url.
+    Otherwise, just return `res` unchanged.
+    """
+    text = res.text
+
+    # Cheap check: real pages won't contain both of these
+    if 'id="cha"' not in text or 'id="tok"' not in text:
+        return res
+
+    tree = html.fromstring(text)
+    tok_nodes = tree.xpath('//input[@id="tok"]/@value')
+    cha_nodes = tree.xpath('//input[@id="cha"]/@value')
+    red_nodes = tree.xpath('//input[@id="red"]/@value')
+    action_nodes = tree.xpath('//form[@id="sec"]/@action')
+
+    if not (tok_nodes and cha_nodes and red_nodes):
+        # Not the challenge form we expect; just return original response
+        return res
+
+    tok = tok_nodes[0]
+    cha = cha_nodes[0]
+    red = red_nodes[0]
+    action = action_nodes[0] if action_nodes else "/c"
+
+    challenge_url = urljoin(res.url, action)
+
+    m = re_difficulty.search(text)
+    difficulty = int(m.group(1)) if m else 4
+
+    with _pow_lock:
+        # Only one thread solves at a time (good for CPU and not hammering Douban)
+        sol = _solve_pow(cha, difficulty)
+        payload = {
+            "tok": tok,
+            "cha": cha,
+            "sol": str(sol),
+            "red": red,
+        }
+
+        parsed = urlparse(res.url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        headers = dict(session.headers)
+        headers.update(
+            {
+                "Referer": res.url,
+                "Origin": origin,
+            }
+        )
+
+        r2 = session.post(challenge_url, data=payload, headers=headers)
+        r2.raise_for_status()
+
+    res2 = session.get(original_url)
+    res2.raise_for_status()
+    return res2
+
 
 def get_tree(url) -> html.HtmlElement:
     res = session.get(url)
     res.raise_for_status()
+    res = _maybe_handle_pow(res, url)
     return html.fromstring(res.content)
 
 
@@ -140,13 +222,13 @@ def scrape(username: str, max_pages: int | None = None) -> dict[int, dict]:
     return results
 
 
-def ensure_output_dir(path_str: str | None) -> Path:
-    if path_str:
-        out_dir = Path(path_str).resolve()
+def ensure_outdir(outdir: Path | None) -> Path:
+    if outdir:
+        outdir = outdir.resolve()
     else:
-        out_dir = Path(__file__).parent.resolve() / "output"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    return out_dir
+        outdir = Path(__file__).parent.resolve() / "output"
+    outdir.mkdir(parents=True, exist_ok=True)
+    return outdir
 
 
 def read_json(json_path) -> list[dict]:
@@ -170,8 +252,8 @@ def write_markdown(md_path, data: list[dict], username: str):
     Write movie titles to a markdown file, grouped by ratings 5→0.
     """
     buckets = [[] for _ in range(6)]
-    for r in data:
-        buckets[r["rating"]].append(r)
+    for d in data:
+        buckets[d["rating"]].append(d)
 
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(f"# Douban movie ratings of {username}\n")
@@ -182,12 +264,12 @@ def write_markdown(md_path, data: list[dict], username: str):
                 f.write(f"\n## {'★'*rating} ({rating} stars)\n\n")
             else:
                 f.write("\n## Unrated\n\n")
-            for r in buckets[rating]:
-                title_zh = r.get("title_zh")
+            for d in buckets[rating]:
+                title_zh = d.get("title_zh")
                 f.write(
-                    f"* {r['title']} / {title_zh} ({r['year']})\n"
+                    f"* {d['title']} / {title_zh} ({d['year']})\n"
                     if title_zh
-                    else f"* {r['title']} ({r['year']})\n"
+                    else f"* {d['title']} ({d['year']})\n"
                 )
 
 
@@ -205,6 +287,7 @@ def parse_args():
     parser.add_argument(
         "-o",
         "--output-dir",
+        type=Path,
         help="Output directory (default: <script_dir>/output)",
     )
     return parser.parse_args()
@@ -214,7 +297,7 @@ def main():
     args = parse_args()
     username = args.username
 
-    json_path = ensure_output_dir(args.output_dir) / f"douban_{username}.json"
+    json_path = ensure_outdir(args.output_dir) / f"douban_{username}.json"
     md_path = json_path.with_suffix(".md")
 
     # Scrape
